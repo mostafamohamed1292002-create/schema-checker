@@ -1,5 +1,8 @@
 import json
-from collections import deque
+import time
+import random
+import threading
+from collections import deque, Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin, urlparse
 
@@ -14,7 +17,7 @@ try:
 except ImportError:
     HAS_EXTRUCT = False
 
-
+# ⚠️⚠️⚠️ حط كلمة السر بتاعتك هنا ⚠️⚠️⚠️
 PASSWORD = "schema@test2026"
 
 # ================== حماية بكلمة سر ==================
@@ -33,9 +36,46 @@ if not st.session_state.auth:
             st.error("كلمة السر غلط")
     st.stop()
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SchemaChecker/1.0)"}
+# متصفح وهمي بشكل متصفح حقيقي عشان الحمايات ما تحجبش الفحص
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept-Language": "ar,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
 SKIP_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".pdf",
              ".zip", ".mp4", ".mp3", ".css", ".js", ".xml", ".ico")
+
+# ================== تبطيء الطلبات عشان الموقع مايزعلش ==================
+MIN_DELAY = 0.5  # أقل فترة بين كل طلب والتاني (بال ثانية)
+_request_lock = threading.Lock()
+_last_request = [0.0]
+
+def polite_get(url, timeout=25):
+    """بياخد مسافة بسيطة بين الطلبات عشان ما نعملش 429"""
+    with _request_lock:
+        passed = time.time() - _last_request[0]
+        if passed < MIN_DELAY:
+            time.sleep(MIN_DELAY - passed + random.uniform(0, 0.15))
+        _last_request[0] = time.time()
+    return requests.get(url, timeout=timeout, headers=HEADERS, allow_redirects=True)
+
+# ================== شرح أكواد الأخطاء بالبلدي ==================
+STATUS_HINTS = {
+    401: "الصفحة محتاجة تسجيل دخول (Unauthorized)",
+    403: "الموقع رافض الوصول (Forbidden) — غالبًا حماية زي Cloudflare واقفة الفحص، جرب تبطئ السرعة وتاني",
+    404: "الصفحة مش موجودة (Not Found) — الرابط بايظ أو الصفحة اتمسحت",
+    408: "السيرفر أخد وقت طويل وقطع الاتصال (Timeout)",
+    410: "الصفحة اتمسحت نهائيًا من الموقع (Gone)",
+    429: "الفحص كان أسرع من تحمّل الموقع (Too Many Requests) — قلل 'عدد الفحوصات المتوازية' وزوّد 'التأخير بين الطلبات' وبعدين اضغط زرار إعادة الفحص",
+    500: "خطأ جوه سيرفر الموقع نفسه (Server Error) — مش من الأداة",
+    502: "مشكلة في بوابة الموقع (Bad Gateway) — غالبًا مؤقتة، جرب تاني",
+    503: "السيرفر مش متاح دلوقتي (Service Unavailable) — صيانة أو ضغط على الموقع",
+    504: "السيرفر أخد وقت طويل في الرد (Gateway Timeout) — جرب تاني",
+}
+
+def status_message(code):
+    hint = STATUS_HINTS.get(code, "كود غير معتاد من السيرفر")
+    return f"الصفحة رجعت كود {code} — {hint}"
 
 # ================== قواعد الفحص (ضيف أي نوع جديد بنفس الشكل) ==================
 SCHEMA_RULES = {
@@ -202,17 +242,17 @@ def normalize_domain(d):
     if d.startswith("www."): d = d[4:]
     return d
 
-def fetch_sitemap(url, session, depth=0):
+def fetch_sitemap(url, depth=0):
     urls = []
     try:
-        r = session.get(url, timeout=15, headers=HEADERS)
+        r = polite_get(url, timeout=15)
         if r.status_code != 200: return urls
         soup = BeautifulSoup(r.content, "html.parser")
         for loc in soup.find_all("loc"):
             u = loc.get_text(strip=True)
             if not u: continue
             if u.lower().endswith(".xml") and depth < 3:
-                urls.extend(fetch_sitemap(u, session, depth + 1))
+                urls.extend(fetch_sitemap(u, depth + 1))
             elif u.startswith("http"):
                 urls.append(u)
     except Exception:
@@ -220,10 +260,9 @@ def fetch_sitemap(url, session, depth=0):
     return urls
 
 def get_sitemap_urls(domain):
-    session = requests.Session()
     for candidate in ["sitemap.xml", "sitemap_index.xml", "sitemap-index.xml", "wp-sitemap.xml"]:
         for scheme in ["https", "http"]:
-            urls = fetch_sitemap(f"{scheme}://{domain}/{candidate}", session)
+            urls = fetch_sitemap(f"{scheme}://{domain}/{candidate}")
             if urls: return urls
     return []
 
@@ -233,7 +272,7 @@ def crawl_site(domain, max_pages):
     while q and len(found) < max_pages:
         url = q.popleft()
         try:
-            r = requests.get(url, timeout=15, headers=HEADERS)
+            r = polite_get(url, timeout=15)
         except Exception:
             continue
         if r.status_code != 200 or "html" not in r.headers.get("Content-Type", "html").lower():
@@ -250,24 +289,56 @@ def crawl_site(domain, max_pages):
                 seen.add(full); q.append(full)
     return found
 
-# ================== فحص صفحة واحدة ==================
-def check_page(url):
-    res = {"url": url, "schemas": [], "issues": [], "skip": False}
-    try:
-        r = requests.get(url, timeout=20, headers=HEADERS, allow_redirects=True)
-    except Exception as e:
-        res["issues"].append(f"مشكلة في الوصول للصفحة ({type(e).__name__})")
+# ================== فحص صفحة واحدة (مع إعادة محاولة) ==================
+def check_page(url, max_retries=3):
+    res = {"url": url, "schemas": [], "issues": [], "skip": False, "access_error": False}
+    code, r = None, None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = polite_get(url)
+        except requests.exceptions.Timeout:
+            if attempt < max_retries:
+                time.sleep(3 * attempt); continue
+            res["issues"].append("الاتصال بالصفحة اتأخر جدًا (Timeout) — السيرفر ماردش في الوقت المحدد، جرب تاني")
+            res["access_error"] = True
+            return res
+        except requests.exceptions.SSLError:
+            res["issues"].append("مشكلة في شهادة الحماية SSL للموقع")
+            res["access_error"] = True
+            return res
+        except Exception as e:
+            if attempt < max_retries:
+                time.sleep(3 * attempt); continue
+            res["issues"].append(f"معرفش أوصل للصفحة ({type(e).__name__}) — افتح اللينك في المتصفح واتأكد إنه شغال")
+            res["access_error"] = True
+            return res
+
+        code = r.status_code
+        if code == 200:
+            break
+        if code == 429 or code >= 500:
+            # استنى شوية وجرب تاني — الموقع بيصبرنا
+            retry_after = str(r.headers.get("Retry-After", ""))
+            wait = int(retry_after) if retry_after.isdigit() else 4 * attempt
+            time.sleep(min(wait, 25))
+            continue
+        break  # 404 / 403 — مفيش فايدة من إعادة المحاولة
+
+    if code is None:
         return res
-    if r.status_code != 200:
-        res["issues"].append(f"الصفحة بترجع كود {r.status_code}")
+    if code != 200:
+        res["issues"].append(status_message(code))
+        res["access_error"] = True
         return res
+
     if "html" not in r.headers.get("Content-Type", "html").lower():
         res["skip"] = True
         return res
 
     schemas = extract_schemas(r.text)
     if not schemas:
-        res["issues"].append("مفيش أي Schema Markup في الصفحة")
+        res["issues"].append("مفيش أي Schema Markup في الصفحة — دي صفحة محتاجة سكيما")
         return res
 
     all_issues, all_types = [], []
@@ -289,13 +360,16 @@ with st.sidebar:
     domain = st.text_input("الدومين", placeholder="example.com")
     max_pages = st.number_input("أقصى عدد صفحات", 5, 1000, 50, 10)
     use_sitemap = st.checkbox("الاعتماد على sitemap.xml أولاً", True)
-    workers = st.slider("عدد الفحوصات المتوازية", 1, 10, 5)
+    workers = st.slider("عدد الفحوصات المتوازية", 1, 10, 3, 1)
+    delay = st.slider("التأخير بين الطلبات (ثانية)", 0.0, 3.0, 0.5, 0.1)
+    st.caption("💡 لو ظهرت صفحات كتير بكود 429: قلل الفحوصات المتوازية لـ 1 وزود التأخير لـ 1.5")
 
 if st.button("🚀 ابدأ الفحص", type="primary"):
     d = normalize_domain(domain)
     if not d:
         st.error("اكتب الدومين الأول ✍️")
     else:
+        MIN_DELAY = delay  # تطبيق التأخير اللي اختاره المستخدم
         with st.spinner("جاري جمع روابط الموقع..."):
             urls = get_sitemap_urls(d) if use_sitemap else []
             urls = [u for u in urls if not u.lower().endswith(SKIP_EXTS)][:max_pages]
@@ -320,11 +394,19 @@ if st.button("🚀 ابدأ الفحص", type="primary"):
             st.session_state["bad_pages"] = sorted([r for r in results if r["issues"]], key=lambda x: x["url"])
             st.session_state["has_results"] = True
 
+# عرض النتائج
 if st.session_state.get("has_results"):
     ok_pages  = st.session_state["ok_pages"]
     bad_pages = st.session_state["bad_pages"]
 
     st.success(f"✅ صفحات سليمة: **{len(ok_pages)}** — ⚠️ صفحات فيها مشاكل: **{len(bad_pages)}**")
+
+    n_rate = sum(1 for r in bad_pages if any("429" in i for i in r["issues"]))
+    if n_rate:
+        st.warning(
+            f"⚠️ في **{n_rate}** صفحة رجعت كود 429 — ده معناه إن الفحص أسرع من تحمّل الموقع والصفحات دي متفحصتش أصلًا. "
+            "قلل 'عدد الفحوصات المتوازية' لـ 1 وزوّد 'التأخير بين الطلبات' لـ 1.5 ثانية وبعدين اضغط زرار إعادة الفحص اللي تحت."
+        )
 
     tab_ok, tab_bad = st.tabs([f"✅ الصفحات السليمة ({len(ok_pages)})", f"⚠️ صفحات فيها مشاكل ({len(bad_pages)})"])
 
@@ -342,18 +424,48 @@ if st.session_state.get("has_results"):
 
     with tab_bad:
         if bad_pages:
+            with st.expander("📊 ملخص المشاكل — كل مشكلة ظهرت كام مرة"):
+                cnt = Counter()
+                for rr in bad_pages:
+                    for i in set(rr["issues"]):
+                        cnt[i] += 1
+                st.dataframe(pd.DataFrame(cnt.most_common(), columns=["المشكلة", "عدد الصفحات"]),
+                             use_container_width=True)
+
             rows = []
             for r in bad_pages:
+                if r["schemas"]:
+                    t = "، ".join(r["schemas"])
+                elif r.get("access_error"):
+                    t = "لم يتم الفحص (الصفحة مارجعتش)"
+                else:
+                    t = "—"
                 for issue in r["issues"]:
-                    rows.append({
-                        "الصفحة": r["url"],
-                        "أنواع السكيما": "، ".join(r["schemas"]) if r["schemas"] else "—",
-                        "المشكلة": issue,
-                    })
+                    rows.append({"الصفحة": r["url"], "أنواع السكيما": t, "المشكلة": issue})
             df = pd.DataFrame(rows)
             st.dataframe(df, use_container_width=True, height=400)
             st.download_button("⬇️ تحميل CSV", df.to_csv(index=False).encode("utf-8-sig"),
                                "problem_pages.csv", "text/csv")
+
+            failed_urls = [r["url"] for r in bad_pages if r.get("access_error")]
+            if failed_urls:
+                if st.button(f"🔄 أعد فحص الصفحات اللي فشل الوصول ليها ({len(failed_urls)}) — بطيء بس يوصل"):
+                    recheck = []
+                    prog = st.progress(0)
+                    with ThreadPoolExecutor(max_workers=workers) as ex:
+                        futs = [ex.submit(check_page, u) for u in failed_urls]
+                        for i, f in enumerate(as_completed(futs), 1):
+                            recheck.append(f.result())
+                            prog.progress(int(i * 100 / len(futs)))
+                    prog.empty()
+                    by_url = {r["url"]: r for r in recheck}
+                    ok_list  = [r for r in st.session_state["ok_pages"] if r["url"] not in by_url]
+                    bad_list = [r for r in st.session_state["bad_pages"] if r["url"] not in by_url]
+                    for r in recheck:
+                        (bad_list if r["issues"] else ok_list).append(r)
+                    st.session_state["ok_pages"]  = sorted(ok_list, key=lambda x: x["url"])
+                    st.session_state["bad_pages"] = sorted(bad_list, key=lambda x: x["url"])
+                    st.rerun()
         else:
             st.balloons()
             st.success("مبروك! كل الصفحات سليمة 🎉")
